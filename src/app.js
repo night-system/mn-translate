@@ -25,7 +25,7 @@
   var CACHE_MAX = 400;
 
   var TEXT_KEYS = ['q', 'text', 'keyword', 'kw', 'query', 'w', 'word', 't', 's', 'src', 'content'];
-  var CONTROL = ['p', 'pass', 'pw', 'code', 'token', 'secret', 'to', 'from', 'dir', 'qps', 'theme', 'reset', 'v', 'debug'];
+  var CONTROL = ['p', 'pass', 'pw', 'code', 'token', 'secret', 'to', 'from', 'dir', 'qps', 'theme', 'bg', 'fg', 'reset', 'v', 'debug'];
   var PASS_KEYS = ['p', 'pass', 'pw', 'code', 'token', 'secret'];
 
   var ERR_MSG = {
@@ -535,11 +535,19 @@
     if (p.get('reset')) {
       try { localStorage.clear(); } catch (e) {}
     }
+    /* ?theme=dark|light —— 覆盖系统配色（面板里手动定死亮/暗） */
     var theme = p.get('theme');
     if (theme === 'dark' || theme === 'light') {
+      document.documentElement.setAttribute('data-theme', theme);
       document.documentElement.style.colorScheme = theme;
-      document.body.style.background = theme === 'dark' ? '#0f1114' : '#fff';
     }
+    /* ?bg=2f333a&fg=e8eaee —— 临时微调底色/字色，方便在 iPad 上现场试色，不改代码 */
+    var hexOf = function (v) {
+      v = (v || '').trim();
+      return /^#?([0-9a-f]{3}|[0-9a-f]{6})$/i.test(v) ? (v.charAt(0) === '#' ? v : '#' + v) : '';
+    };
+    if (hexOf(p.get('bg'))) document.documentElement.style.setProperty('--bg', hexOf(p.get('bg')));
+    if (hexOf(p.get('fg'))) document.documentElement.style.setProperty('--fg', hexOf(p.get('fg')));
     var dir = p.get('dir');
     if (dir) { pref.dir = dir === 'auto' ? 'auto' : (dir === 'zh2en' ? 'zh2en' : 'en2zh'); savePref(); }
 

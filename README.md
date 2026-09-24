@@ -47,6 +47,7 @@ https://night-system.github.io/mn-translate/?p=<你的口令>&q={keyword}
 | `p=` / `pass=` / `pw=` / `code=` | 解密口令 |
 | `dir=auto\|zh2en\|en2zh` 或 `to=en\|zh` | 强制语向 |
 | `theme=dark\|light` | 强制配色（默认跟随系统） |
+| `bg=RRGGBB` / `fg=RRGGBB` | 临时改底色 / 字色，例如 `&bg=2f333a&fg=eceef2`，**不用改代码就能在现场试色** |
 | `reset=1` | 清空本机缓存的口令/密钥/译文缓存 |
 
 也支持这些写法（MarginNote 里如果占位符拼不成查询串时可用）：

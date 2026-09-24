@@ -14,12 +14,23 @@
   --chip:#f2f4f7; --chip-fg:#5b6270; --accent:#2f6fed; --err:#d64545;
   --skeleton:#eef0f3;
 }
+/* 深色不用纯黑：深灰底，长时间看不刺眼 */
+:root[data-theme="dark"]{
+  --bg:#23262b; --fg:#e7e9ee; --muted:#9aa2ad; --line:#343841;
+  --chip:#2d3138; --chip-fg:#aab2bd; --accent:#6ea8ff; --err:#ff8f8f;
+  --skeleton:#2d3138;
+}
 @media (prefers-color-scheme:dark){
-  :root{
-    --bg:#0f1114; --fg:#e9ecf1; --muted:#7f8794; --line:#23272e;
-    --chip:#1a1e24; --chip-fg:#9aa3b2; --accent:#63a0ff; --err:#ff8080;
-    --skeleton:#1c2027;
+  :root:not([data-theme="light"]){
+    --bg:#23262b; --fg:#e7e9ee; --muted:#9aa2ad; --line:#343841;
+    --chip:#2d3138; --chip-fg:#aab2bd; --accent:#6ea8ff; --err:#ff8f8f;
+    --skeleton:#2d3138;
   }
+}
+:root[data-theme="light"]{
+  --bg:#ffffff; --fg:#14161a; --muted:#8b919b; --line:#e9ebef;
+  --chip:#f2f4f7; --chip-fg:#5b6270; --accent:#2f6fed; --err:#d64545;
+  --skeleton:#eef0f3;
 }
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 html,body{height:100%;margin:0}

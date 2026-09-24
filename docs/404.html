@@ -14,12 +14,23 @@
   --chip:#f2f4f7; --chip-fg:#5b6270; --accent:#2f6fed; --err:#d64545;
   --skeleton:#eef0f3;
 }
+/* 深色不用纯黑：深灰底，长时间看不刺眼 */
+:root[data-theme="dark"]{
+  --bg:#23262b; --fg:#e7e9ee; --muted:#9aa2ad; --line:#343841;
+  --chip:#2d3138; --chip-fg:#aab2bd; --accent:#6ea8ff; --err:#ff8f8f;
+  --skeleton:#2d3138;
+}
 @media (prefers-color-scheme:dark){
-  :root{
-    --bg:#0f1114; --fg:#e9ecf1; --muted:#7f8794; --line:#23272e;
-    --chip:#1a1e24; --chip-fg:#9aa3b2; --accent:#63a0ff; --err:#ff8080;
-    --skeleton:#1c2027;
+  :root:not([data-theme="light"]){
+    --bg:#23262b; --fg:#e7e9ee; --muted:#9aa2ad; --line:#343841;
+    --chip:#2d3138; --chip-fg:#aab2bd; --accent:#6ea8ff; --err:#ff8f8f;
+    --skeleton:#2d3138;
   }
+}
+:root[data-theme="light"]{
+  --bg:#ffffff; --fg:#14161a; --muted:#8b919b; --line:#e9ebef;
+  --chip:#f2f4f7; --chip-fg:#5b6270; --accent:#2f6fed; --err:#d64545;
+  --skeleton:#eef0f3;
 }
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 html,body{height:100%;margin:0}
@@ -141,7 +152,7 @@ footer{
   'use strict';
 
   /* ===================== 构建期注入 ===================== */
-  var CRED_BLOB = {"v":1,"iter":200000,"salt":"XWR//m8TdKHrG4t5m3lOBw==","iv":"W7Wz4WMHxxt92uVM","ct":"rcJNmav31IuyC3ZZlUnxiR1R5FvBqL0sz4pwh/D07q9xSSDjCRp2CAfeeUZZQZPrG4nVTu/+ae0V08bHJ89tMbZ9pK5MJgLlWig="};
+  var CRED_BLOB = {"v":1,"iter":200000,"salt":"cmjpktaGNzO75H83GQ8itQ==","iv":"ru8QfbXWovalZcjk","ct":"GrI2eKvtP0y7ExpX19Am4a8EfdvH5YIB/3mWJXyqQoLgmC4C6BjMwou1YKF1sd8temyQR3qjFw2AerYH4H/J9tAdHuYmOnwVQPI="};
 
   /* ===================== 常量 ===================== */
   var ENDPOINT = 'https://fanyi-api.baidu.com/api/trans/vip/translate';
@@ -156,7 +167,7 @@ footer{
   var CACHE_MAX = 400;
 
   var TEXT_KEYS = ['q', 'text', 'keyword', 'kw', 'query', 'w', 'word', 't', 's', 'src', 'content'];
-  var CONTROL = ['p', 'pass', 'pw', 'code', 'token', 'secret', 'to', 'from', 'dir', 'qps', 'theme', 'reset', 'v', 'debug'];
+  var CONTROL = ['p', 'pass', 'pw', 'code', 'token', 'secret', 'to', 'from', 'dir', 'qps', 'theme', 'bg', 'fg', 'reset', 'v', 'debug'];
   var PASS_KEYS = ['p', 'pass', 'pw', 'code', 'token', 'secret'];
 
   var ERR_MSG = {
@@ -666,11 +677,19 @@ footer{
     if (p.get('reset')) {
       try { localStorage.clear(); } catch (e) {}
     }
+    /* ?theme=dark|light —— 覆盖系统配色（面板里手动定死亮/暗） */
     var theme = p.get('theme');
     if (theme === 'dark' || theme === 'light') {
+      document.documentElement.setAttribute('data-theme', theme);
       document.documentElement.style.colorScheme = theme;
-      document.body.style.background = theme === 'dark' ? '#0f1114' : '#fff';
     }
+    /* ?bg=2f333a&fg=e8eaee —— 临时微调底色/字色，方便在 iPad 上现场试色，不改代码 */
+    var hexOf = function (v) {
+      v = (v || '').trim();
+      return /^#?([0-9a-f]{3}|[0-9a-f]{6})$/i.test(v) ? (v.charAt(0) === '#' ? v : '#' + v) : '';
+    };
+    if (hexOf(p.get('bg'))) document.documentElement.style.setProperty('--bg', hexOf(p.get('bg')));
+    if (hexOf(p.get('fg'))) document.documentElement.style.setProperty('--fg', hexOf(p.get('fg')));
     var dir = p.get('dir');
     if (dir) { pref.dir = dir === 'auto' ? 'auto' : (dir === 'zh2en' ? 'zh2en' : 'en2zh'); savePref(); }
 
