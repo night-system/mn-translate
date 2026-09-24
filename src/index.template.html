@@ -103,6 +103,13 @@ footer{
   opacity:0;pointer-events:none;transition:opacity .18s,transform .18s;backdrop-filter:blur(6px);
 }
 #toast.on{opacity:1;transform:translateX(-50%) translateY(0)}
+/* MarginNote 面板被拖得很矮时，压缩上下两条工具带，把高度让给译文 */
+@media (max-height:300px){
+  header{padding:5px 12px 4px;min-height:26px}
+  main{padding:9px 14px 6px}
+  footer{padding:4px 10px calc(4px + env(safe-area-inset-bottom))}
+  .act{min-height:32px;font-size:12px}
+}
 </style>
 </head>
 <body>
