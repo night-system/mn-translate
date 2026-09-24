@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex,nofollow,noarchive">
+<link rel="icon" href="data:,">
+<title>译</title>
+<style>
+:root{
+  --bg:#ffffff; --fg:#14161a; --muted:#8b919b; --line:#e9ebef;
+  --chip:#f2f4f7; --chip-fg:#5b6270; --accent:#2f6fed; --err:#d64545;
+  --skeleton:#eef0f3;
+}
+@media (prefers-color-scheme:dark){
+  :root{
+    --bg:#0f1114; --fg:#e9ecf1; --muted:#7f8794; --line:#23272e;
+    --chip:#1a1e24; --chip-fg:#9aa3b2; --accent:#63a0ff; --err:#ff8080;
+    --skeleton:#1c2027;
+  }
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{height:100%;margin:0}
+body{
+  background:var(--bg);color:var(--fg);
+  font:400 17px/1.7 -apple-system,BlinkMacSystemFont,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",system-ui,sans-serif;
+  display:flex;flex-direction:column;
+  padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+  -webkit-text-size-adjust:100%;
+  overflow:hidden;
+}
+header{
+  flex:0 0 auto;display:flex;align-items:center;gap:8px;
+  padding:8px 14px 6px;min-height:34px;
+  border-bottom:1px solid var(--line);
+}
+.chip{
+  font-size:11px;line-height:1;letter-spacing:.02em;
+  padding:5px 8px;border-radius:99px;background:var(--chip);color:var(--chip-fg);
+  border:none;font-family:inherit;cursor:pointer;white-space:nowrap;
+}
+button.chip:active{opacity:.6}
+.spacer{flex:1}
+.status{font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:45%}
+.status.busy{color:var(--accent)}
+.status.err{color:var(--err)}
+main{
+  flex:1 1 auto;min-height:0;overflow-y:auto;-webkit-overflow-scrolling:touch;
+  padding:14px 16px 10px;
+}
+#out{
+  font-size:clamp(16px,4.7vw,19px);line-height:1.72;
+  white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;
+  -webkit-user-select:text;user-select:text;
+  animation:fade .22s ease-out;
+}
+@keyframes fade{from{opacity:0;transform:translateY(2px)}to{opacity:1;transform:none}}
+#out .ln+.ln{margin-top:.55em}
+.hint{color:var(--muted);font-size:13px;line-height:1.8}
+.hint b{color:var(--fg);font-weight:600}
+.hint code{
+  font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;
+  background:var(--chip);padding:2px 5px;border-radius:5px;word-break:break-all;color:var(--chip-fg);
+}
+.error{color:var(--err);font-size:15px;line-height:1.7}
+.error .sub{display:block;color:var(--muted);font-size:12.5px;margin-top:6px}
+a.fallback{
+  display:inline-block;margin-top:14px;font-size:12.5px;color:var(--muted);
+  text-decoration:none;border-bottom:1px dotted var(--muted);
+}
+.sk{border-radius:7px;background:var(--skeleton);animation:pulse 1.25s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.45}}
+.sk.s1{height:15px;width:93%}
+.sk.s2{height:15px;width:78%;margin-top:12px}
+.sk.s3{height:15px;width:60%;margin-top:12px}
+textarea{
+  width:100%;min-height:72px;resize:none;padding:10px 12px;margin-top:12px;
+  font:inherit;font-size:15px;color:var(--fg);background:var(--chip);
+  border:1px solid var(--line);border-radius:11px;outline:none;
+}
+textarea::placeholder{color:var(--muted)}
+.go{
+  margin-top:10px;width:100%;padding:11px;border-radius:11px;border:none;
+  background:var(--accent);color:#fff;font:600 15px/1 inherit;cursor:pointer;
+}
+.go:active{opacity:.75}
+footer{
+  flex:0 0 auto;display:flex;gap:8px;align-items:center;
+  padding:6px 12px calc(6px + env(safe-area-inset-bottom));
+  border-top:1px solid var(--line);
+}
+.act{
+  flex:1;min-height:38px;border-radius:10px;border:1px solid var(--line);
+  background:transparent;color:var(--chip-fg);font:500 13px/1 inherit;cursor:pointer;
+}
+.act:active{background:var(--chip)}
+.act[disabled]{opacity:.4}
+#toast{
+  position:fixed;left:50%;bottom:calc(64px + env(safe-area-inset-bottom));transform:translateX(-50%) translateY(6px);
+  background:#000c;color:#fff;font-size:12.5px;padding:7px 13px;border-radius:99px;
+  opacity:0;pointer-events:none;transition:opacity .18s,transform .18s;backdrop-filter:blur(6px);
+}
+#toast.on{opacity:1;transform:translateX(-50%) translateY(0)}
+</style>
+</head>
+<body>
+<header>
+  <button class="chip" id="dir" hidden>EN → 中</button>
+  <div class="spacer"></div>
+  <div class="status" id="status"></div>
+</header>
+
+<main><div id="out"></div></main>
+
+<footer>
+  <button class="act" id="copy" disabled>复制</button>
+  <button class="act" id="redo" disabled>重译</button>
+</footer>
+
+<div id="toast"></div>
+
+<script>
+/*__APP_JS__*/
+</script>
+</body>
+</html>

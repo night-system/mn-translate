@@ -1,0 +1,6 @@
+# 私密文件，绝不提交
+secrets.local.json
+_secrets*
+_scratch/
+.venv/
+*.log

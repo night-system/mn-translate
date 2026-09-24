@@ -1,0 +1,602 @@
+/* MarginNote 划词翻译面板 —— 单文件前端
+ * 设计要点：
+ *  1. 百度通用翻译接口不返回 CORS 头，浏览器 fetch 会被拦，但接口支持 callback 参数，
+ *     因此用 <script> JSONP 取数（已实测接口无 X-Content-Type-Options: nosniff）。
+ *  2. appid/密钥不落地明文：由 tools/build.mjs 用 PBKDF2+AES-GCM 加密后注入 CRED_BLOB，
+ *     口令经 MarginNote 自定义 URL 传入，只在设备本地解密并缓存。
+ *  3. 该 appid 为标准版（QPS=1），因此所有请求串行 + 最小间隔 + 54003 退避重试。
+ */
+(function () {
+  'use strict';
+
+  /* ===================== 构建期注入 ===================== */
+  var CRED_BLOB = __CRED_BLOB__;
+
+  /* ===================== 常量 ===================== */
+  var ENDPOINT = 'https://fanyi-api.baidu.com/api/trans/vip/translate';
+  var MIN_GAP = 1050;          // 请求最小间隔 ms（标准版 QPS=1）
+  var MAX_RETRY = 4;           // 54003 最大重试次数
+  var RETRY_WAIT = 1200;       // 54003 退避 ms
+  var MAX_BYTES = 4800;        // 单次请求 UTF-8 字节上限（接口上限 6000）
+  var LS_CRED = 'mnt.cred.v2';
+  var LS_CACHE = 'mnt.cache.v2';
+  var LS_PREF = 'mnt.pref.v2';
+  var LS_LAST = 'mnt.last.v2';   // 上次请求时间戳（跨页面刷新共用，避免滑动时撞限速）
+  var CACHE_MAX = 400;
+
+  var TEXT_KEYS = ['q', 'text', 'keyword', 'kw', 'query', 'w', 'word', 't', 's', 'src', 'content'];
+  var CONTROL = ['p', 'pass', 'pw', 'code', 'token', 'secret', 'to', 'from', 'dir', 'qps', 'theme', 'reset', 'v', 'debug'];
+  var PASS_KEYS = ['p', 'pass', 'pw', 'code', 'token', 'secret'];
+
+  var ERR_MSG = {
+    '52001': ['请求超时', '请重试'],
+    '52002': ['服务端系统错误', '请稍后重试'],
+    '52003': ['未授权用户', 'appid 或密钥不正确'],
+    '54000': ['必填参数为空', '选中内容为空？'],
+    '54001': ['签名错误', '密钥可能已被更换，需要重新构建页面'],
+    '54003': ['请求过于频繁', '标准版限速 1 次/秒，已自动排队重试'],
+    '54004': ['账户余额不足', '请到百度翻译开放平台充值'],
+    '54005': ['长文本请求频繁', '请稍后重试'],
+    '58000': ['客户端 IP 未授权', '百度后台开启了 IP 白名单，需关闭'],
+    '58001': ['语言方向不支持', '请切换语向后重试'],
+    '58002': ['服务已关闭', '请到百度翻译开放平台开启服务'],
+    '90107': ['认证未通过', '实名认证未完成或未生效']
+  };
+
+  var $ = function (id) { return document.getElementById(id); };
+  var out = $('out'), statusEl = $('status'), dirBtn = $('dir'), copyBtn = $('copy'), redoBtn = $('redo');
+
+  var creds = null;
+  var current = { text: '', dir: 'auto', result: '' };
+  var token = 0;
+  var gate = Promise.resolve();
+  var lastAt = readLastAt();
+  var cache = loadCache();
+  var pref = loadPref();
+
+  /* ===================== 工具 ===================== */
+  var sleep = function (ms) { return new Promise(function (r) { setTimeout(r, ms); }); };
+
+  function toast(msg) {
+    var t = $('toast');
+    t.textContent = msg;
+    t.classList.add('on');
+    clearTimeout(toast._t);
+    toast._t = setTimeout(function () { t.classList.remove('on'); }, 1400);
+  }
+
+  function b64ToBytes(b64) {
+    var bin = atob(b64.replace(/-/g, '+').replace(/_/g, '/'));
+    var arr = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+    return arr;
+  }
+  function bytesToB64(bytes) {
+    var s = '';
+    for (var i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+    return btoa(s);
+  }
+  function utf8Bytes(str) { return new TextEncoder().encode(str); }
+
+  /* UTF-8 安全截断（不切断多字节字符） */
+  function clampBytes(str, max) {
+    var enc = utf8Bytes(str);
+    if (enc.length <= max) return str;
+    var s = new TextDecoder('utf-8', { fatal: false }).decode(enc.slice(0, max));
+    return s.replace(/\uFFFD+$/, '');
+  }
+
+  /* ===================== MD5（RFC 1321，用于百度签名） ===================== */
+  var MD5_K = (function () {
+    var k = new Uint32Array(64);
+    for (var i = 0; i < 64; i++) k[i] = Math.floor(Math.abs(Math.sin(i + 1)) * 4294967296);
+    return k;
+  })();
+  var MD5_S = [
+    7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+    5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
+    4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+    6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21
+  ];
+
+  function md5(str) {
+    var bytes = utf8Bytes(str);
+    var len = bytes.length;
+    var withPad = (((len + 8) >> 6) + 1) << 6;   // 含 0x80 与 8 字节长度
+    var buf = new Uint8Array(withPad);
+    buf.set(bytes);
+    buf[len] = 0x80;
+    var bitLen = len * 8;
+    // 64 位长度，小端（JS 下 >2^32 位用高 32 位补齐）
+    var hi = Math.floor(bitLen / 4294967296);
+    var lo = bitLen >>> 0;
+    var dv = new DataView(buf.buffer);
+    dv.setUint32(withPad - 8, lo, true);
+    dv.setUint32(withPad - 4, hi, true);
+
+    var a0 = 0x67452301, b0 = 0xefcdab89, c0 = 0x98badcfe, d0 = 0x10325476;
+    var M = new Int32Array(16);
+
+    for (var off = 0; off < withPad; off += 64) {
+      for (var j = 0; j < 16; j++) M[j] = dv.getInt32(off + j * 4, true);
+      var a = a0, b = b0, c = c0, d = d0;
+      for (var i = 0; i < 64; i++) {
+        var f, g;
+        if (i < 16) { f = (b & c) | (~b & d); g = i; }
+        else if (i < 32) { f = (d & b) | (~d & c); g = (5 * i + 1) % 16; }
+        else if (i < 48) { f = b ^ c ^ d; g = (3 * i + 5) % 16; }
+        else { f = c ^ (b | ~d); g = (7 * i) % 16; }
+        var tmp = d;
+        d = c; c = b;
+        var x = (a + f + MD5_K[i] + M[g]) | 0;
+        var s = MD5_S[i];
+        b = (b + ((x << s) | (x >>> (32 - s)))) | 0;
+        a = tmp;
+      }
+      a0 = (a0 + a) | 0; b0 = (b0 + b) | 0; c0 = (c0 + c) | 0; d0 = (d0 + d) | 0;
+    }
+
+    return hexLE(a0) + hexLE(b0) + hexLE(c0) + hexLE(d0);
+  }
+  function hexLE(n) {
+    var s = '';
+    for (var i = 0; i < 4; i++) {
+      var b = (n >>> (i * 8)) & 0xff;
+      s += (b < 16 ? '0' : '') + b.toString(16);
+    }
+    return s;
+  }
+
+  /* ===================== URL 参数解析 ===================== */
+  function params() { return new URLSearchParams(location.search); }
+
+  function decodeSafe(s) {
+    try { return decodeURIComponent(s.replace(/\+/g, ' ')); } catch (e) { return s; }
+  }
+
+  function getPassphrase() {
+    var p = params();
+    for (var i = 0; i < PASS_KEYS.length; i++) {
+      var v = p.get(PASS_KEYS[i]);
+      if (v) return v;
+    }
+    var h = location.hash.replace(/^#/, '');
+    if (h) {
+      var m = /(?:^|&)(?:p|pass|pw|code|token|secret)=([^&]+)/.exec(h);
+      if (m) return decodeSafe(m[1]);
+    }
+    return '';
+  }
+
+  function getQueryText() {
+    var p = params();
+    for (var i = 0; i < TEXT_KEYS.length; i++) {
+      var v = p.get(TEXT_KEYS[i]);
+      if (v && v.trim()) return v.trim();
+    }
+    // #q=xxx 或 #裸文本
+    var h = location.hash.replace(/^#/, '');
+    if (h) {
+      var m = /(?:^|&)(?:q|text|keyword|kw|w|word|t|s)=([^&]*)/.exec(h);
+      if (m && m[1]) return decodeSafe(m[1]).trim();
+      if (!/^[a-z]+=/i.test(h)) return decodeSafe(h).trim();
+    }
+    // 路径式：/mn-translate/<文本>
+    var path = location.pathname;
+    var slash = path.lastIndexOf('/');
+    var tail = path.slice(slash + 1);
+    if (tail && tail !== 'index.html') return decodeSafe(tail).trim();
+    // 兜底：?<任意未知参数>（如 ?{keyword} 直接拼在问号后）
+    var keys = [];
+    p.forEach(function (val, key) { keys.push([key, val]); });
+    for (var j = 0; j < keys.length; j++) {
+      var k = keys[j][0], val = keys[j][1];
+      if (CONTROL.indexOf(k) !== -1) continue;
+      if (val && val.trim()) return val.trim();
+      if (k && k.trim()) return decodeSafe(k).trim();
+    }
+    return '';
+  }
+
+  /* ===================== 凭据解锁 ===================== */
+  function saveCreds(c) { try { localStorage.setItem(LS_CRED, JSON.stringify(c)); } catch (e) {} }
+  function loadCreds() {
+    try {
+      var raw = localStorage.getItem(LS_CRED);
+      if (!raw) return null;
+      var c = JSON.parse(raw);
+      return (c && c.appid && c.key) ? c : null;
+    } catch (e) { return null; }
+  }
+
+  function unlock(pass) {
+    if (!window.crypto || !crypto.subtle) return Promise.reject(new Error('nosubtle'));
+    var salt = b64ToBytes(CRED_BLOB.salt);
+    var iv = b64ToBytes(CRED_BLOB.iv);
+    var ct = b64ToBytes(CRED_BLOB.ct);
+    return crypto.subtle
+      .importKey('raw', utf8Bytes(pass), 'PBKDF2', false, ['deriveKey'])
+      .then(function (km) {
+        return crypto.subtle.deriveKey(
+          { name: 'PBKDF2', salt: salt, iterations: CRED_BLOB.iter, hash: 'SHA-256' },
+          km, { name: 'AES-GCM', length: 256 }, false, ['decrypt']
+        );
+      })
+      .then(function (key) { return crypto.subtle.decrypt({ name: 'AES-GCM', iv: iv }, key, ct); })
+      .then(function (pt) { return JSON.parse(new TextDecoder().decode(pt)); })
+      .then(function (obj) {
+        if (!obj || !obj.appid || !obj.key) throw new Error('bad blob');
+        return obj;
+      });
+  }
+
+  /* ===================== 缓存 ===================== */
+  function loadCache() {
+    try {
+      var raw = localStorage.getItem(LS_CACHE);
+      var obj = raw ? JSON.parse(raw) : {};
+      return (obj && typeof obj === 'object') ? obj : {};
+    } catch (e) { return {}; }
+  }
+  function putCache(k, v) {
+    cache[k] = v;
+    var keys = Object.keys(cache);
+    if (keys.length > CACHE_MAX) { for (var i = 0; i < keys.length - CACHE_MAX; i++) delete cache[keys[i]]; }
+    try { localStorage.setItem(LS_CACHE, JSON.stringify(cache)); } catch (e) {}
+  }
+  function loadPref() {
+    try { return JSON.parse(localStorage.getItem(LS_PREF)) || {}; } catch (e) { return {}; }
+  }
+  function savePref() { try { localStorage.setItem(LS_PREF, JSON.stringify(pref)); } catch (e) {} }
+
+  function readLastAt() {
+    try { return Number(localStorage.getItem(LS_LAST)) || 0; } catch (e) { return 0; }
+  }
+  function markLastAt() {
+    var now = Date.now();
+    try { localStorage.setItem(LS_LAST, String(now)); } catch (e) {}
+    return now;
+  }
+
+  /* ===================== 语向判定 ===================== */
+  function detectDir(text) {
+    var cjk = (text.match(/[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/g) || []).length;
+    var total = (text.replace(/\s/g, '').length) || 1;
+    return (cjk / total) > 0.25 ? 'zh2en' : 'en2zh';
+  }
+  function resolveDir(text) {
+    var mode = pref.dir || 'auto';
+    var p = params();
+    var q = (p.get('dir') || p.get('to') || '').toLowerCase();
+    if (q) {
+      if (q === 'en' || q === 'en2zh' || q === 'zh') mode = 'en2zh';
+      else if (q === 'zh2en' || q === 'zh-cn2en') mode = 'zh2en';
+    }
+    if (mode === 'auto') mode = detectDir(text);
+    return mode === 'zh2en' ? { mode: 'zh2en', from: 'zh', to: 'en', label: '中 → EN' }
+                            : { mode: 'en2zh', from: 'auto', to: 'zh', label: 'EN → 中' };
+  }
+
+  /* ===================== 请求（串行 + 限速 + 退避） ===================== */
+  function ApiError(code, msg) { this.code = String(code); this.msg = msg || ''; }
+  ApiError.prototype = Object.create(Error.prototype);
+
+  function jsonp(url, timeout) {
+    return new Promise(function (resolve, reject) {
+      var name = '__bd_cb' + Date.now() + '_' + Math.floor(Math.random() * 1e6);
+      var s = document.createElement('script');
+      var done = false;
+      var timer = setTimeout(function () { fin(new Error('timeout')); }, timeout || 15000);
+      function fin(err, data) {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        try { delete window[name]; } catch (e) { window[name] = undefined; }
+        if (s.parentNode) s.parentNode.removeChild(s);
+        err ? reject(err) : resolve(data);
+      }
+      window[name] = function (data) { fin(null, data); };
+      s.onerror = function () { fin(new Error('network')); };
+      s.src = url + '&callback=' + name;
+      (document.head || document.documentElement).appendChild(s);
+    });
+  }
+
+  function buildUrl(text, dir, appid, key) {
+    var q = clampBytes(text, MAX_BYTES);
+    var salt = String(Date.now()) + Math.floor(Math.random() * 1000);
+    var sign = md5(appid + q + salt + key);
+    var parts = [
+      'q=' + encodeURIComponent(q),
+      'from=' + dir.from,
+      'to=' + dir.to,
+      'appid=' + encodeURIComponent(appid),
+      'salt=' + encodeURIComponent(salt),
+      'sign=' + sign
+    ];
+    return { url: ENDPOINT + '?' + parts.join('&'), q: q, truncated: q.length !== text.length };
+  }
+
+  /* 串行闸门：保证任意两次网络请求间隔 >= MIN_GAP（含上一次页面加载时的请求） */
+  function schedule(fn, onWait) {
+    var run = gate.then(function () {
+      var wait = Math.max(0, MIN_GAP - (Date.now() - lastAt));
+      return (wait > 0 ? sleep(wait) : Promise.resolve()).then(function () {
+        lastAt = markLastAt();
+        return fn();
+      });
+    });
+    gate = run.then(function () {}, function () {});
+    if (onWait) onWait(Math.max(0, MIN_GAP - (Date.now() - lastAt)));
+    return run;
+  }
+
+  function fetchTranslation(text, dir, my) {
+    var built = buildUrl(text, dir, creds.appid, creds.key);
+    var attempt = 0;
+    function once() {
+      if (my !== token) throw new Error('stale');
+      return jsonp(built.url).then(function (data) {
+        if (data && data.error_code) {
+          var code = String(data.error_code);
+          if ((code === '54003' || code === '54005') && attempt < MAX_RETRY) {
+            attempt++;
+            setStatus('排队中… (' + attempt + '/' + MAX_RETRY + ')', 'busy');
+            return sleep(RETRY_WAIT).then(once);
+          }
+          throw new ApiError(code, data.error_msg);
+        }
+        return data;
+      });
+    }
+    return schedule(once, function (wait) {
+      if (wait > 250) setStatus('限速排队…', 'busy');
+    }).then(function (data) { return { data: data, truncated: built.truncated }; });
+  }
+
+  /* ===================== 渲染 ===================== */
+  function setStatus(text, kind) {
+    statusEl.textContent = text || '';
+    statusEl.className = 'status' + (kind ? ' ' + kind : '');
+  }
+
+  function renderSkeleton() {
+    out.innerHTML = '<div class="sk s1"></div><div class="sk s2"></div><div class="sk s3"></div>';
+  }
+
+  function renderText(t) {
+    out.textContent = '';
+    var lines = String(t).split('\n');
+    for (var i = 0; i < lines.length; i++) {
+      if (!lines[i]) continue;
+      var d = document.createElement('div');
+      d.className = 'ln';
+      d.textContent = lines[i];
+      out.appendChild(d);
+    }
+    if (!out.childNodes.length) out.textContent = t;
+    out.style.animation = 'none';
+    void out.offsetWidth;
+    out.style.animation = '';
+  }
+
+  function renderError(title, sub) {
+    out.innerHTML = '';
+    var d = document.createElement('div');
+    d.className = 'error';
+    d.textContent = title;
+    if (sub) {
+      var s = document.createElement('span');
+      s.className = 'sub';
+      s.textContent = sub;
+      d.appendChild(s);
+    }
+    out.appendChild(d);
+  }
+
+  function renderHint(html) { out.innerHTML = '<div class="hint">' + html + '</div>'; }
+
+  /* 出错时的兜底：用回原来的有道网页（同一个 webview 内打开，可返回） */
+  function addFallbackLink() {
+    if (!current.text) return;
+    var a = document.createElement('a');
+    a.className = 'fallback';
+    a.href = 'https://www.youdao.com/w/eng/' + encodeURIComponent(current.text.slice(0, 200));
+    a.rel = 'noopener';
+    a.textContent = '改用有道词典打开 ↗';
+    out.appendChild(a);
+  }
+
+  function renderLock(wrong) {
+    renderHint(
+      '<b>🔒 需要口令</b><br>在 MarginNote 的自定义 URL 里带上口令参数即可自动解锁：<br>' +
+      '<code>?p=你的口令&amp;q={keyword}</code>' +
+      (wrong ? '<br><span style="color:var(--err)">口令不正确，请重试</span>' : '')
+    );
+    var box = document.createElement('div');
+    box.innerHTML = '<textarea id="passIn" placeholder="也可在此输入口令（仅存本机）"></textarea>' +
+                    '<button class="go" id="passGo">解锁</button>';
+    out.appendChild(box);
+    $('passGo').addEventListener('click', function () {
+      var v = $('passIn').value.trim();
+      if (!v) return;
+      doUnlock(v, true);
+    });
+  }
+
+  function renderEmpty() {
+    renderHint(
+      '<b>未收到要翻译的文字</b><br>' +
+      '在 MarginNote 里选中文字 → 研究/浏览器 → 自定义搜索，URL 填：<br>' +
+      '<code>https://' + location.host + location.pathname + '?p=口令&amp;q={keyword}</code><br>' +
+      '也可以先在下面手动试一条：'
+    );
+    var box = document.createElement('div');
+    box.innerHTML = '<textarea id="manIn" placeholder="输入要翻译的文字…"></textarea>' +
+                    '<button class="go" id="manGo">翻译</button>';
+    out.appendChild(box);
+    $('manGo').addEventListener('click', function () {
+      var v = $('manIn').value.trim();
+      if (v) { current.text = v; run(true); }
+    });
+    $('manIn').addEventListener('keydown', function (e) {
+      if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') $('manGo').click();
+    });
+  }
+
+  function updateDirChip(dir) {
+    dirBtn.hidden = false;
+    if ((pref.dir || 'auto') === 'auto') dirBtn.textContent = dir.label + ' · 自动';
+    else dirBtn.textContent = dir.label;
+  }
+
+  function setActions(on) {
+    copyBtn.disabled = !on;
+    redoBtn.disabled = !on;
+  }
+
+  /* ===================== 主流程 ===================== */
+  function run(force) {
+    var text = current.text;
+    if (!text) { renderEmpty(); setStatus(''); setActions(false); return; }
+
+    var dir = resolveDir(text);
+    updateDirChip(dir);
+
+    var baseKey = text + '|' + dir.mode;
+    if (!force && cache[baseKey]) {
+      current.result = cache[baseKey];
+      renderText(current.result);
+      setStatus('已缓存 · ' + text.length + ' 字');
+      setActions(true);
+      return;
+    }
+
+    var my = ++token;
+    renderSkeleton();
+    setStatus('翻译中…', 'busy');
+    setActions(false);
+
+    fetchTranslation(text, dir, my).then(function (res) {
+      if (my !== token) return;
+      var list = (res.data && res.data.trans_result) || [];
+      var txt = list.map(function (x) { return x.dst; }).join('\n');
+      if (!txt) throw new ApiError('empty', 'no result');
+      current.result = txt;
+      putCache(baseKey, txt);
+      renderText(txt);
+      setStatus((res.truncated ? '已截断 · ' : '') + text.length + ' 字');
+      setActions(true);
+    }).catch(function (err) {
+      if (my !== token || (err && err.message === 'stale')) return;
+      setActions(true);
+      if (err instanceof ApiError) {
+        var m = ERR_MSG[err.code];
+        if (err.code === 'empty') {
+          renderError('没有返回译文', '换个语向或稍后重试');
+          setStatus('无结果', 'err');
+        } else {
+          renderError((m ? m[0] : '翻译失败') + '（' + err.code + '）', (m ? m[1] : err.msg) || err.msg);
+          setStatus('失败 ' + err.code, 'err');
+        }
+      } else if (err && err.message === 'timeout') {
+        renderError('请求超时', '检查网络后点「重译」');
+        setStatus('超时', 'err');
+      } else {
+        renderError('网络错误', '无法连接百度翻译接口，检查网络后点「重译」');
+        setStatus('网络错误', 'err');
+      }
+      addFallbackLink();
+    });
+  }
+
+  function doUnlock(pass, interactive) {
+    setStatus('解锁中…', 'busy');
+    return unlock(pass).then(function (c) {
+      creds = c;
+      saveCreds(c);
+      setStatus('');
+      run(false);
+      if (interactive) toast('已解锁');
+      return true;
+    }).catch(function (e) {
+      setStatus('');
+      if (e && e.message === 'nosubtle') {
+        renderError('当前环境不支持解密', '需要 HTTPS 打开本页');
+      } else {
+        renderLock(true);
+      }
+      return false;
+    });
+  }
+
+  function boot() {
+    var p = params();
+    if (p.get('reset')) {
+      try { localStorage.clear(); } catch (e) {}
+    }
+    var theme = p.get('theme');
+    if (theme === 'dark' || theme === 'light') {
+      document.documentElement.style.colorScheme = theme;
+      document.body.style.background = theme === 'dark' ? '#0f1114' : '#fff';
+    }
+    var dir = p.get('dir');
+    if (dir) { pref.dir = dir === 'auto' ? 'auto' : (dir === 'zh2en' ? 'zh2en' : 'en2zh'); savePref(); }
+
+    current.text = getQueryText();
+    var pass = getPassphrase();
+
+    if (!current.text) {
+      renderEmpty();
+      setStatus(pass ? '等待文字…' : '未配置');
+      setActions(false);
+      return;
+    }
+
+    creds = loadCreds();
+    if (creds) { setStatus(''); run(false); return; }
+    if (pass) { doUnlock(pass, false); return; }
+    renderLock(false);
+  }
+
+  /* ===================== 事件 ===================== */
+  copyBtn.addEventListener('click', function () {
+    var t = current.result;
+    if (!t) return;
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(t).then(function () { toast('已复制'); }, fallbackCopy);
+    } else fallbackCopy();
+    function fallbackCopy() {
+      var ta = document.createElement('textarea');
+      ta.value = t;
+      ta.style.position = 'fixed'; ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      try { document.execCommand('copy'); toast('已复制'); } catch (e) { toast('复制失败'); }
+      document.body.removeChild(ta);
+    }
+  });
+
+  redoBtn.addEventListener('click', function () { run(true); });
+
+  dirBtn.addEventListener('click', function () {
+    var cur = pref.dir || 'auto';
+    pref.dir = cur === 'auto' ? 'zh2en' : (cur === 'zh2en' ? 'en2zh' : 'auto');
+    savePref();
+    toast(pref.dir === 'auto' ? '自动判定语向' : (pref.dir === 'zh2en' ? '强制 中→英' : '强制 英→中'));
+    run(true);
+  });
+
+  window.addEventListener('hashchange', function () {
+    var t = getQueryText();
+    if (t && t !== current.text) { current.text = t; run(false); }
+  });
+  window.addEventListener('pageshow', function (e) {
+    if (e.persisted) {
+      var t = getQueryText();
+      if (t && t !== current.text) { current.text = t; run(false); }
+    }
+  });
+
+  boot();
+})();
