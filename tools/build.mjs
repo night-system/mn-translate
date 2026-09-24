@@ -87,6 +87,9 @@ html = html.replace('/*__APP_JS__*/', () => appInjected);
 
 fs.mkdirSync(OUTDIR, { recursive: true });
 fs.writeFileSync(OUT, html, 'utf8');
+// GitHub Pages 对未匹配路径返回 404.html，这里放一份同样的页面，
+// 使 /mn-translate/<文本> 这种「路径式」URL 也能正常翻译（SPA 兜底技巧）。
+fs.writeFileSync(path.join(OUTDIR, '404.html'), html, 'utf8');
 fs.writeFileSync(path.join(OUTDIR, '.nojekyll'), '');
 fs.writeFileSync(path.join(OUTDIR, 'robots.txt'), 'User-agent: *\nDisallow: /\n');
 
